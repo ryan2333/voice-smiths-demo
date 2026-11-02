@@ -1,7 +1,13 @@
+import asyncio
+import builtins
+import sys
 import unittest
+from unittest.mock import patch
 
 from backend.core import (
     UNKNOWN_SPEAKER,
+    Segment,
+    TTSGenerator,
     VoiceProfile,
     assign_voices,
     detect_roles,
@@ -37,6 +43,24 @@ class CoreParsingTests(unittest.TestCase):
 
     def test_detect_roles_preserves_first_appearance_order(self) -> None:
         self.assertEqual(detect_roles("甲：一\n乙：二\n甲：三"), ["甲", "乙"])
+
+    def test_missing_tts_dependencies_report_module_and_current_interpreter(self) -> None:
+        original_import = builtins.__import__
+        for missing_module in ("edge_tts", "aiohttp"):
+            with self.subTest(missing_module=missing_module):
+                import_error = ModuleNotFoundError(f"No module named '{missing_module}'", name=missing_module)
+
+                def import_with_missing_dependency(name, *args, **kwargs):
+                    if name == "edge_tts":
+                        raise import_error
+                    return original_import(name, *args, **kwargs)
+
+                with patch("builtins.__import__", side_effect=import_with_missing_dependency):
+                    with self.assertRaisesRegex(RuntimeError, missing_module) as raised:
+                        asyncio.run(TTSGenerator(".").generate_segment(Segment(id=1, text="测试"), "unused.mp3"))
+                self.assertIn(sys.executable, str(raised.exception))
+                self.assertIn("-m pip install edge-tts", str(raised.exception))
+                self.assertIs(raised.exception.__cause__, import_error)
 
 
 if __name__ == "__main__":

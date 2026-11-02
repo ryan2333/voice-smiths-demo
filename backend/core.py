@@ -13,13 +13,26 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
+
+from .audio import get_ffmpeg_executable, merge_audio_segments
 
 
 NARRATOR = "旁白"
 UNKNOWN_SPEAKER = "未识别角色"
+
+
+def chapter_audio_filename(title: str) -> str:
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", title).strip(" .")
+    name = name.encode("utf-8")[:180].decode("utf-8", errors="ignore").rstrip(" .") or "未命名章节"
+    reserved = {"CON", "PRN", "AUX", "NUL"}
+    reserved.update(f"{prefix}{index}" for prefix in ("COM", "LPT") for index in range(1, 10))
+    if name.split(".")[0].upper() in reserved:
+        name = f"_{name}"
+    return f"{name}.mp3"
 
 
 @dataclass
@@ -358,9 +371,14 @@ class TTSGenerator:
     player can use to preserve chapter and role boundaries.
     """
 
-    def __init__(self, output_dir: str | Path, *, default_voice: str = DEFAULT_VOICES[0]):
+    def __init__(
+        self, output_dir: str | Path, *, default_voice: str = DEFAULT_VOICES[0],
+        connect_timeout: int = 10, receive_timeout: int = 60,
+    ):
         self.output_dir = Path(output_dir)
         self.default_voice = default_voice
+        self.connect_timeout = connect_timeout
+        self.receive_timeout = receive_timeout
 
     @staticmethod
     def _safe_name(value: str) -> str:
@@ -373,7 +391,10 @@ class TTSGenerator:
         try:
             import edge_tts  # type: ignore
         except ImportError as exc:  # pragma: no cover - depends on environment
-            raise RuntimeError("Audio generation requires optional dependency 'edge-tts'. Install it with: pip install edge-tts") from exc
+            raise RuntimeError(
+                f'语音依赖加载失败：{exc}。请使用启动应用的 Python 安装依赖：'
+                f'"{sys.executable}" -m pip install edge-tts'
+            ) from exc
 
         voice = segment.voice or self.default_voice
         communicate = edge_tts.Communicate(
@@ -382,6 +403,8 @@ class TTSGenerator:
             rate=segment.rate,
             volume=segment.volume,
             pitch=segment.pitch,
+            connect_timeout=self.connect_timeout,
+            receive_timeout=self.receive_timeout,
         )
         path = Path(output_path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -394,27 +417,40 @@ class TTSGenerator:
         *,
         segments: Sequence[Segment] | None = None,
         chapter_dir: str | Path | None = None,
+        progress: Callable[[int, int, str], None] | None = None,
     ) -> list[Path]:
-        """Render all segments in one chapter, returning paths in playback order."""
+        """Render role segments and return a single merged chapter MP3 path."""
 
         chapter_segments = list(segments if segments is not None else chapter.segments)
+        if not chapter_segments:
+            raise ValueError("章节没有可配音的片段")
+        executable = get_ffmpeg_executable()
         target_dir = Path(chapter_dir) if chapter_dir is not None else self.output_dir / f"chapter_{chapter.number:03d}"
         target_dir.mkdir(parents=True, exist_ok=True)
         paths: list[Path] = []
+        if progress:
+            progress(0, len(chapter_segments), "synthesizing")
         for index, segment in enumerate(chapter_segments, start=1):
             filename = f"{index:04d}_{self._safe_name(segment.speaker)}.mp3"
             paths.append(await self.generate_segment(segment, target_dir / filename))
+            if progress:
+                progress(index, len(chapter_segments), "synthesizing")
 
+        audio_path = target_dir / chapter_audio_filename(chapter.title)
+        if progress:
+            progress(len(chapter_segments), len(chapter_segments), "merging")
+        await asyncio.to_thread(merge_audio_segments, paths, audio_path, executable=executable)
         manifest = {
             "number": chapter.number,
             "title": chapter.title,
+            "audio": audio_path.name,
             "segments": [
                 {**asdict(segment), "audio": str(path.name)}
                 for segment, path in zip(chapter_segments, paths)
             ],
         }
         (target_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        return paths
+        return [audio_path]
 
     async def generate_novel(self, chapters: Iterable[Chapter]) -> dict[int, list[Path]]:
         """Render chapters sequentially and return paths keyed by chapter number."""

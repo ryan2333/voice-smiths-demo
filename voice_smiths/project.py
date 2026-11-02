@@ -125,7 +125,7 @@ def render_project(
 
     ``project`` may be the dictionary returned by :func:`parse_novel` or the
     path to a saved ``project.json``.  The return value contains string paths,
-    making it suitable for JSON responses.
+    with one merged MP3 per chapter, making it suitable for JSON responses.
     """
 
     if isinstance(project, (str, Path)):
