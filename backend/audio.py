@@ -2,12 +2,45 @@
 
 from __future__ import annotations
 
+import json
+import logging
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from typing import Sequence
+
+
+logger = logging.getLogger(__name__)
+
+
+def cleanup_chapter_intermediates(audio_path: Path) -> int:
+    manifest_path = audio_path.parent / "manifest.json"
+    removed = 0
+    try:
+        if not audio_path.is_file() or audio_path.stat().st_size == 0 or not manifest_path.is_file():
+            return removed
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict) or manifest.get("audio") != audio_path.name:
+            return removed
+        segments = manifest.get("segments")
+        if not isinstance(segments, list):
+            return removed
+        for segment in segments:
+            name = segment.get("audio") if isinstance(segment, dict) else None
+            if not isinstance(name, str) or Path(name).name != name or not re.fullmatch(r"\d{4,}_[^/\\]+\.mp3", name):
+                continue
+            path = audio_path.parent / name
+            if path.name != audio_path.name and not path.is_symlink() and path.is_file():
+                path.unlink()
+                removed += 1
+        manifest_path.unlink()
+        return removed + 1
+    except (OSError, ValueError, UnicodeError):
+        logger.warning("无法清理章节中间文件：%s", manifest_path, exc_info=True)
+        return removed
 
 
 def get_ffmpeg_executable() -> str:

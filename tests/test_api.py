@@ -1,4 +1,5 @@
 import asyncio
+import json
 import tempfile
 import threading
 import time
@@ -168,6 +169,28 @@ class ApiTests(unittest.TestCase):
                 recovered = self.wait_for_job(client, job["id"])
                 self.assertEqual(recovered["status"], "done", recovered)
                 self.assertEqual(client.get(recovered["download_url"]).content, b"recovered-audio")
+
+    def test_startup_cleans_completed_legacy_segments_and_keeps_download_and_source(self) -> None:
+        with TestClient(create_app(self.settings)) as client:
+            project = self.create_project(client)
+        storage = Storage(self.settings)
+        job, created = storage.create_job(project["id"], 0, project["chapters"][0])
+        self.assertTrue(created)
+        target = self.settings.audio_dir / job["id"] / "chapter_001"
+        target.mkdir(parents=True)
+        audio = target / "chapter_001_初见.mp3"
+        audio.write_bytes(b"complete-audio")
+        segment = target / "0001_旁白.mp3"
+        segment.write_bytes(b"segment")
+        manifest = target / "manifest.json"
+        manifest.write_text(json.dumps({"audio": audio.name, "segments": [{"audio": segment.name}]}), encoding="utf-8")
+        storage.update_job(job["id"], status="done", audio_path=str(audio))
+        with TestClient(create_app(self.settings)) as client:
+            self.assertFalse(segment.exists())
+            self.assertFalse(manifest.exists())
+            self.assertEqual(client.get(f"/api/jobs/{job['id']}/audio").content, b"complete-audio")
+            self.assertEqual(client.get(f"/api/projects/{project['id']}").json(), project)
+            self.assertTrue(Path(project["source_path"]).is_file())
 
     def test_cors_and_unknown_resources(self) -> None:
         with TestClient(create_app(self.settings)) as client:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+from .audio import cleanup_chapter_intermediates
 from .core import Chapter, Segment, TTSGenerator
 from .storage import Storage
 
@@ -14,7 +15,13 @@ class JobManager:
         self.workers: list[asyncio.Task] = []
 
     async def start(self) -> None:
-        for job_id in self.storage.recover_jobs():
+        queued = self.storage.recover_jobs()
+        for job in self.storage.list_jobs():
+            if job["status"] == "done" and job["audio_path"]:
+                audio = Path(job["audio_path"]).resolve()
+                if audio.is_relative_to(self.storage.settings.audio_dir.resolve()):
+                    await asyncio.to_thread(cleanup_chapter_intermediates, audio)
+        for job_id in queued:
             self.queue.put_nowait(job_id)
         self.workers = [asyncio.create_task(self._worker()) for _ in range(self.storage.settings.workers)]
 

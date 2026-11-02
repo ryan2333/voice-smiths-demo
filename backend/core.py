@@ -11,14 +11,14 @@ it; audio generation reports a useful installation message when it is missing.
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 import sys
-from dataclasses import asdict, dataclass, field
+import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from .audio import get_ffmpeg_executable, merge_audio_segments
+from .audio import cleanup_chapter_intermediates, get_ffmpeg_executable, merge_audio_segments
 
 
 NARRATOR = "旁白"
@@ -367,8 +367,8 @@ class TTSGenerator:
     """Render parsed segments to MP3 files with optional ``edge-tts``.
 
     The provider is imported lazily so parsing works in a minimal Python
-    installation.  Generated files are accompanied by a JSON manifest that a
-    player can use to preserve chapter and role boundaries.
+    installation. Intermediate segments are temporary; only the merged chapter
+    MP3 is retained after generation.
     """
 
     def __init__(
@@ -427,29 +427,31 @@ class TTSGenerator:
         executable = get_ffmpeg_executable()
         target_dir = Path(chapter_dir) if chapter_dir is not None else self.output_dir / f"chapter_{chapter.number:03d}"
         target_dir.mkdir(parents=True, exist_ok=True)
-        paths: list[Path] = []
-        if progress:
-            progress(0, len(chapter_segments), "synthesizing")
-        for index, segment in enumerate(chapter_segments, start=1):
-            filename = f"{index:04d}_{self._safe_name(segment.speaker)}.mp3"
-            paths.append(await self.generate_segment(segment, target_dir / filename))
-            if progress:
-                progress(index, len(chapter_segments), "synthesizing")
-
         audio_path = target_dir / chapter_audio_filename(chapter.title)
-        if progress:
-            progress(len(chapter_segments), len(chapter_segments), "merging")
-        await asyncio.to_thread(merge_audio_segments, paths, audio_path, executable=executable)
-        manifest = {
-            "number": chapter.number,
-            "title": chapter.title,
-            "audio": audio_path.name,
-            "segments": [
-                {**asdict(segment), "audio": str(path.name)}
-                for segment, path in zip(chapter_segments, paths)
-            ],
-        }
-        (target_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        with tempfile.TemporaryDirectory(prefix=".synthesis-", dir=target_dir) as directory:
+            temporary_dir = Path(directory)
+            paths: list[Path] = []
+            if progress:
+                progress(0, len(chapter_segments), "synthesizing")
+            for index, segment in enumerate(chapter_segments, start=1):
+                filename = f"{index:04d}_{self._safe_name(segment.speaker)}.mp3"
+                paths.append(await self.generate_segment(segment, temporary_dir / filename))
+                if progress:
+                    progress(index, len(chapter_segments), "synthesizing")
+
+            if progress:
+                progress(len(chapter_segments), len(chapter_segments), "merging")
+            merged = temporary_dir / "chapter.mp3"
+            merging = asyncio.create_task(asyncio.to_thread(merge_audio_segments, paths, merged, executable=executable))
+            try:
+                await asyncio.shield(merging)
+            except asyncio.CancelledError:
+                await asyncio.gather(merging, return_exceptions=True)
+                raise
+            if not merged.is_file() or merged.stat().st_size == 0:
+                raise RuntimeError("章节合并未生成有效音频")
+            merged.replace(audio_path)
+        cleanup_chapter_intermediates(audio_path)
         return [audio_path]
 
     async def generate_novel(self, chapters: Iterable[Chapter]) -> dict[int, list[Path]]:
