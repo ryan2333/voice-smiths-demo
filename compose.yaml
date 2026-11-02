@@ -1,0 +1,45 @@
+name: voice-smiths
+
+services:
+  backend:
+    image: ${IMAGE_PREFIX:-voice-smiths}-backend:${TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim-bookworm}
+    init: true
+    restart: unless-stopped
+    environment:
+      VOICE_SMITHS_HOST: 0.0.0.0
+      VOICE_SMITHS_PORT: "8765"
+      VOICE_SMITHS_DATA_DIR: /data
+      VOICE_SMITHS_UPLOAD_DIR: /data/uploads
+      VOICE_SMITHS_AUDIO_DIR: /data/audio
+      VOICE_SMITHS_WORKERS: ${VOICE_SMITHS_WORKERS:-2}
+      VOICE_SMITHS_CONNECT_TIMEOUT: ${VOICE_SMITHS_CONNECT_TIMEOUT:-10}
+      VOICE_SMITHS_RECEIVE_TIMEOUT: ${VOICE_SMITHS_RECEIVE_TIMEOUT:-60}
+      VOICE_SMITHS_CORS_ORIGINS: ${VOICE_SMITHS_CORS_ORIGINS:-http://localhost:8080,http://127.0.0.1:8080}
+    volumes:
+      - ${STORAGE_DIR:-./docker-data}:/data
+      - ${UPLOAD_DIR:-${STORAGE_DIR:-./docker-data}/uploads}:/data/uploads
+      - ${AUDIO_DIR:-${STORAGE_DIR:-./docker-data}/audio}:/data/audio
+    expose:
+      - "8765"
+    stop_grace_period: 30s
+
+  frontend:
+    image: ${IMAGE_PREFIX:-voice-smiths}-frontend:${TAG:-latest}
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:22-alpine}
+        NGINX_IMAGE: ${NGINX_IMAGE:-nginx:1.28-alpine}
+        VITE_API_BASE: ${VITE_API_BASE:-}
+    restart: unless-stopped
+    ports:
+      - ${WEB_BIND:-127.0.0.1}:${WEB_PORT:-8080}:80
+    depends_on:
+      backend:
+        condition: service_healthy

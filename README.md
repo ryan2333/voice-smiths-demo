@@ -95,6 +95,58 @@ npm --prefix frontend run preview
 
 生产文件输出到 `frontend/dist/`，可由 Nginx 或其他静态服务器托管；把 `/api` 反向代理到后端。若前后端使用不同域名，在构建前设置 `VITE_API_BASE=https://api.example.com`，并将前端来源加入后端 `VOICE_SMITHS_CORS_ORIGINS`。开发代理目标可通过 `frontend/.env.local` 中的 `VITE_API_PROXY` 修改，示例见 `frontend/.env.example`。
 
+## Docker 镜像与打包
+
+需要 Docker Engine / Docker Desktop、Docker Compose v2+ 和 Make。在项目根目录运行：
+
+```bash
+make build
+make up
+```
+
+访问 <http://127.0.0.1:8080>。`make up` 也会构建镜像，可以单独运行。前端使用 Node 构建后由 Nginx 托管，后端使用 Python 3.12 和系统 FFmpeg；两个镜像分别为 `voice-smiths-frontend:latest`、`voice-smiths-backend:latest`。Nginx 将 `/api` 转发到后端，不限制上传文件大小，后端端口仅在容器网络内使用。镜像构建上下文只包含代码和依赖清单，不包含本机小说、音频、虚拟环境或环境配置文件。
+
+容器默认使用宿主机 `docker-data/` 保存数据：
+
+```text
+docker-data/
+  uploads/
+  audio/
+  voice-smiths.sqlite3
+```
+
+可指定端口、数据根目录，以及分别指定原稿和音频保存目录：
+
+```bash
+make up WEB_PORT=8088 STORAGE_DIR=/srv/voice-smiths
+make up STORAGE_DIR=/srv/voice-smiths UPLOAD_DIR=/srv/novels AUDIO_DIR=/srv/audio
+```
+
+这些是宿主机目录，容器内固定为 `/data`、`/data/uploads`、`/data/audio`。为便于在新机器恢复，保持相同的容器内路径；备份和迁移时同时保存数据库、原稿和音频目录。容器数据独立于本地开发的 `data/`；本地开发数据库记录了宿主机绝对路径，不能直接当作容器数据库使用。
+
+默认只监听本机。需要其他机器访问时，运行 `make up WEB_BIND=0.0.0.0`。生成并发与超时仍可使用 `VOICE_SMITHS_WORKERS`、`VOICE_SMITHS_CONNECT_TIMEOUT`、`VOICE_SMITHS_RECEIVE_TIMEOUT` 配置。Compose 可从根目录 `.env` 读取这些配置和目录、端口参数，镜像名与版本使用 Make 参数指定。
+
+打包镜像并在另一台机器加载：
+
+```bash
+make save TAG=v1.0.0 PLATFORM=linux/amd64
+make load TAG=v1.0.0 ARCHIVE=dist/images/voice-smiths-v1.0.0.tar
+make start TAG=v1.0.0
+```
+
+`make save` 会构建两个镜像并导出到 `dist/images/voice-smiths-<TAG>.tar`，不包含运行数据。目标机器需要复制 `compose.yaml`、`Makefile` 和镜像包，再执行 `make load`、`make start`；生成语音时仍需访问在线语音服务。省略 `PLATFORM` 时按当前 Docker 引擎架构构建，Apple Silicon 构建 Linux x86 服务器镜像时指定 `PLATFORM=linux/amd64`。`make start` 不构建、不拉取镜像，适合离线导入后启动。
+
+推送到镜像仓库时先登录，再使用相同的镜像前缀和版本：
+
+```bash
+make build IMAGE_PREFIX=registry.example.com/team/voice-smiths TAG=v1.0.0
+make push IMAGE_PREFIX=registry.example.com/team/voice-smiths TAG=v1.0.0
+```
+
+若构建环境无法访问 Docker Hub，可通过 `PYTHON_IMAGE`、`NODE_IMAGE`、`NGINX_IMAGE` 参数指定可访问的基础镜像地址，例如 `make build PYTHON_IMAGE=registry.example.com/library/python:3.12-slim-bookworm NODE_IMAGE=registry.example.com/library/node:22-alpine NGINX_IMAGE=registry.example.com/library/nginx:1.28-alpine`。基础镜像需保持相同的运行环境。
+
+`make logs` 查看日志，`make ps` 查看健康状态，`make down` 停止并移除容器，宿主机的数据文件会保留。`make help` 可查看全部命令。
+
 ## API
 
 | 方法与路径 | 功能 |
