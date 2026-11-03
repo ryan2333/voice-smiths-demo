@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import unquote
 from unittest.mock import patch
@@ -27,6 +28,19 @@ class ApiTests(unittest.TestCase):
         root = Path(self.directory.name)
         self.settings = Settings(data_dir=root / "metadata", upload_dir=root / "原稿", audio_dir=root / "音频", workers=1)
 
+    @contextmanager
+    def client(self, application=None):
+        with TestClient(application or create_app(self.settings)) as client:
+            credentials = {"email": "reader@example.com", "password": "reader-password-123"}
+            response = client.post("/api/auth/register", json={**credentials, "display_name": "测试读者"})
+            if response.status_code == 409:
+                response = client.post("/api/auth/login", json=credentials)
+            response.raise_for_status()
+            session = response.json()
+            self.tenant_id = session["tenants"][0]["id"]
+            client.headers.update({"X-CSRF-Token": session["csrf_token"], "X-Tenant-ID": self.tenant_id})
+            yield client
+
     def create_project(self, client):
         response = client.post("/api/projects", json={"title": "测试小说", "text": TEXT})
         self.assertEqual(response.status_code, 201, response.text)
@@ -42,7 +56,7 @@ class ApiTests(unittest.TestCase):
 
     def test_original_gbk_file_and_project_are_persisted_in_custom_directory(self) -> None:
         original = TEXT.encode("gbk")
-        with TestClient(create_app(self.settings)) as client:
+        with self.client() as client:
             response = client.post("/api/projects/upload", files={"file": ("故事.txt", original, "text/plain")})
             self.assertEqual(response.status_code, 201, response.text)
             project = response.json()
@@ -53,21 +67,21 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(project["chapter_count"], 2)
             self.assertEqual(project["chapters"][0]["segments"][0]["speaker"], "林默")
             self.assertEqual(project["chapters"][0]["segments"][0]["voice"], project["chapters"][1]["segments"][1]["voice"])
-            self.assertEqual(client.get("/api/config").json()["audio_dir"], str(self.settings.audio_dir))
-        with TestClient(create_app(self.settings)) as client:
+            self.assertEqual(client.get("/api/config").json()["audio_dir"], str(self.settings.audio_dir / self.tenant_id))
+        with self.client() as client:
             self.assertEqual(client.get(f"/api/projects/{project['id']}").json(), project)
             self.assertEqual(len(client.get("/api/projects").json()["projects"]), 1)
 
     def test_upload_larger_than_five_megabytes(self) -> None:
         original = ("第一章\n" + "中文" * 900_000).encode("utf-8")
         self.assertGreater(len(original), 5 * 1024 * 1024)
-        with TestClient(create_app(self.settings)) as client:
+        with self.client() as client:
             response = client.post("/api/projects/upload", files={"file": ("large.txt", original)})
             self.assertEqual(response.status_code, 201, response.text[:200])
             self.assertEqual(Path(response.json()["source_path"]).read_bytes(), original)
 
     def test_invalid_encoding_does_not_replace_existing_project(self) -> None:
-        with TestClient(create_app(self.settings)) as client:
+        with self.client() as client:
             project = self.create_project(client)
             response = client.post("/api/projects/upload", files={"file": ("bad.txt", b"\xb5")})
             self.assertEqual(response.status_code, 400)
@@ -75,13 +89,13 @@ class ApiTests(unittest.TestCase):
             self.assertTrue(Path(project["source_path"]).is_file())
 
     def test_manual_big5_and_voice_settings_survive_reload(self) -> None:
-        with TestClient(create_app(self.settings)) as client:
+        with self.client() as client:
             response = client.post("/api/projects/upload", files={"file": ("繁體.txt", "第一章\n角色：你好".encode("big5"))}, data={"encoding": "big5"})
             self.assertEqual(response.status_code, 201, response.text)
             project = response.json()
             response = client.patch(f"/api/projects/{project['id']}", json={"voice_map": {"角色": {"voice": "zh-CN-YunxiNeural", "rate": "-10%"}}})
             self.assertEqual(response.status_code, 200, response.text)
-        with TestClient(create_app(self.settings)) as client:
+        with self.client() as client:
             saved = client.get(f"/api/projects/{project['id']}").json()
             self.assertEqual(saved["chapters"][0]["segments"][0]["rate"], "-10%")
             self.assertEqual(saved["voice_map"]["角色"]["voice"], "zh-CN-YunxiNeural")
@@ -101,7 +115,7 @@ class ApiTests(unittest.TestCase):
             return [audio]
 
         with patch.object(TTSGenerator, "generate_chapter", new=generate):
-            with TestClient(create_app(self.settings)) as client:
+            with self.client() as client:
                 project = self.create_project(client)
                 payload = {"project_id": project["id"], "chapter_index": 0}
                 response = client.post("/api/jobs", json=payload)
@@ -123,7 +137,7 @@ class ApiTests(unittest.TestCase):
                 self.assertIn("attachment", response.headers["content-disposition"])
                 self.assertIn("初见.mp3", unquote(response.headers["content-disposition"]))
                 self.assertEqual(complete["filename"], "初见.mp3")
-        with TestClient(create_app(self.settings)) as client:
+        with self.client() as client:
             self.assertEqual(client.get(f"/api/jobs/{job['id']}").json()["status"], "done")
             self.assertEqual(client.get(complete["audio_url"]).content, b"test-audio")
 
@@ -132,7 +146,7 @@ class ApiTests(unittest.TestCase):
             raise RuntimeError("语音服务连接失败")
 
         with patch.object(TTSGenerator, "generate_chapter", new=fail):
-            with TestClient(create_app(self.settings)) as client:
+            with self.client() as client:
                 project = self.create_project(client)
                 job = client.post("/api/jobs", json={"project_id": project["id"], "chapter_index": 0}).json()
                 complete = self.wait_for_job(client, job["id"])
@@ -143,16 +157,16 @@ class ApiTests(unittest.TestCase):
                 self.assertNotEqual(response.json()["id"], job["id"])
 
     def test_startup_marks_inflight_jobs_interrupted(self) -> None:
-        with TestClient(create_app(self.settings)) as client:
+        with self.client() as client:
             project = self.create_project(client)
         storage = Storage(self.settings)
         job, created = storage.create_job(project["id"], 0, project["chapters"][0])
         storage.update_job(job["id"], status="running")
-        with TestClient(create_app(self.settings)) as client:
+        with self.client() as client:
             self.assertEqual(client.get(f"/api/jobs/{job['id']}").json()["status"], "interrupted")
 
     def test_startup_resumes_persisted_queued_jobs(self) -> None:
-        with TestClient(create_app(self.settings)) as client:
+        with self.client() as client:
             project = self.create_project(client)
         storage = Storage(self.settings)
         job, created = storage.create_job(project["id"], 0, project["chapters"][0])
@@ -165,13 +179,13 @@ class ApiTests(unittest.TestCase):
             return [audio]
 
         with patch.object(TTSGenerator, "generate_chapter", new=generate):
-            with TestClient(create_app(self.settings)) as client:
+            with self.client() as client:
                 recovered = self.wait_for_job(client, job["id"])
                 self.assertEqual(recovered["status"], "done", recovered)
                 self.assertEqual(client.get(recovered["download_url"]).content, b"recovered-audio")
 
     def test_startup_cleans_completed_legacy_segments_and_keeps_download_and_source(self) -> None:
-        with TestClient(create_app(self.settings)) as client:
+        with self.client() as client:
             project = self.create_project(client)
         storage = Storage(self.settings)
         job, created = storage.create_job(project["id"], 0, project["chapters"][0])
@@ -185,7 +199,7 @@ class ApiTests(unittest.TestCase):
         manifest = target / "manifest.json"
         manifest.write_text(json.dumps({"audio": audio.name, "segments": [{"audio": segment.name}]}), encoding="utf-8")
         storage.update_job(job["id"], status="done", audio_path=str(audio))
-        with TestClient(create_app(self.settings)) as client:
+        with self.client() as client:
             self.assertFalse(segment.exists())
             self.assertFalse(manifest.exists())
             self.assertEqual(client.get(f"/api/jobs/{job['id']}/audio").content, b"complete-audio")
@@ -193,7 +207,7 @@ class ApiTests(unittest.TestCase):
             self.assertTrue(Path(project["source_path"]).is_file())
 
     def test_cors_and_unknown_resources(self) -> None:
-        with TestClient(create_app(self.settings)) as client:
+        with self.client() as client:
             response = client.options("/api/jobs", headers={"Origin": "http://localhost:5173", "Access-Control-Request-Method": "POST"})
             self.assertEqual(response.headers["access-control-allow-origin"], "http://localhost:5173")
             self.assertEqual(client.get("/api/projects/missing").status_code, 404)
@@ -205,7 +219,7 @@ class ApiTests(unittest.TestCase):
 
         application = create_app(self.settings)
         with patch.object(TTSGenerator, "generate_chapter", new=pending):
-            with TestClient(application) as client:
+            with self.client(application) as client:
                 project = self.create_project(client)
                 payload = {"project_id": project["id"], "chapter_indices": [0, 99]}
                 self.assertEqual(client.post("/api/jobs/batch", json=payload).status_code, 404)
@@ -235,7 +249,7 @@ class ApiTests(unittest.TestCase):
 
         payload = {"voice": "zh-CN-YunxiNeural", "rate": "-10%", "pitch": "+5Hz", "text": "你好，欢迎试听。"}
         with patch.object(TTSGenerator, "generate_segment", new=generate):
-            with TestClient(create_app(self.settings)) as client:
+            with self.client() as client:
                 response = client.post("/api/voices/preview", json=payload)
                 self.assertEqual(response.status_code, 200, response.text)
                 audio_url = response.json()["audio_url"]
@@ -246,11 +260,11 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(client.get("/api/jobs").json()["jobs"], [])
                 changed = client.post("/api/voices/preview", json={**payload, "voice": "zh-CN-XiaoxiaoNeural"})
                 self.assertNotEqual(changed.json()["audio_url"], audio_url)
-            with TestClient(create_app(self.settings)) as client:
+            with self.client() as client:
                 self.assertEqual(client.get(audio_url).content, b"voice-preview")
                 client.post("/api/voices/preview", json=payload).raise_for_status()
                 self.assertEqual(len(calls), 2)
-        self.assertEqual(list((self.settings.audio_dir / "previews").glob("*.tmp.mp3")), [])
+        self.assertEqual(list((self.settings.audio_dir / self.tenant_id / "previews").glob("*.tmp.mp3")), [])
 
     def test_preview_failure_cleans_up_and_can_be_retried(self) -> None:
         async def fail(generator, segment, output_path):
@@ -259,7 +273,7 @@ class ApiTests(unittest.TestCase):
             raise RuntimeError("语音服务暂不可用")
 
         with patch.object(TTSGenerator, "generate_segment", new=fail):
-            with TestClient(create_app(self.settings)) as client:
+            with self.client() as client:
                 payload = {"voice": "zh-CN-YunxiNeural", "text": "测试"}
                 for attempt in range(2):
                     response = client.post("/api/voices/preview", json=payload)
@@ -269,7 +283,7 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(client.post("/api/voices/preview", json={**payload, "text": "  "}).status_code, 400)
                 self.assertEqual(client.get("/api/voices/previews/invalid/audio").status_code, 404)
                 self.assertEqual(client.get(f"/api/voices/previews/{'a' * 64}/audio").status_code, 404)
-        self.assertEqual(list((self.settings.audio_dir / "previews").iterdir()), [])
+        self.assertEqual(list((self.settings.audio_dir / self.tenant_id / "previews").iterdir()), [])
 
     def test_concurrent_previews_share_the_same_generation(self) -> None:
         calls = []

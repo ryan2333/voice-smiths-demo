@@ -33,6 +33,11 @@ class Storage:
                     audio_path TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, payload TEXT NOT NULL
                 );
             """)
+            for table in ("projects", "jobs"):
+                columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+                if "tenant_id" not in columns:
+                    connection.execute(f"ALTER TABLE {table} ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'legacy'")
+                connection.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_tenant ON {table}(tenant_id)")
 
     @contextmanager
     def connect(self):
@@ -44,23 +49,31 @@ class Storage:
         finally:
             connection.close()
 
-    def save_project(self, project: dict[str, Any]) -> dict[str, Any]:
+    def save_project(self, project: dict[str, Any], tenant_id: str | None = None) -> dict[str, Any]:
         with self.connect() as connection:
-            connection.execute(
-                "INSERT INTO projects (id, title, created_at, payload) VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(id) DO UPDATE SET title=excluded.title, payload=excluded.payload",
-                (project["id"], project["title"], project["created_at"], json.dumps(project, ensure_ascii=False)),
+            if tenant_id is None:
+                existing = connection.execute("SELECT tenant_id FROM projects WHERE id=?", (project["id"],)).fetchone()
+                tenant_id = existing["tenant_id"] if existing else "legacy"
+            cursor = connection.execute(
+                "INSERT INTO projects (id, title, created_at, payload, tenant_id) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET title=excluded.title, payload=excluded.payload "
+                "WHERE projects.tenant_id=excluded.tenant_id",
+                (project["id"], project["title"], project["created_at"], json.dumps(project, ensure_ascii=False), tenant_id),
             )
+            if cursor.rowcount != 1:
+                raise ValueError("作品不属于当前工作空间")
         return project
 
-    def get_project(self, project_id: str) -> dict[str, Any] | None:
+    def get_project(self, project_id: str, tenant_id: str | None = None) -> dict[str, Any] | None:
         with self.connect() as connection:
-            row = connection.execute("SELECT payload FROM projects WHERE id=?", (project_id,)).fetchone()
+            row = connection.execute("SELECT payload FROM projects WHERE id=?" + (" AND tenant_id=?" if tenant_id else ""),
+                                     (project_id, tenant_id) if tenant_id else (project_id,)).fetchone()
         return json.loads(row["payload"]) if row else None
 
-    def list_projects(self) -> list[dict[str, Any]]:
+    def list_projects(self, tenant_id: str | None = None) -> list[dict[str, Any]]:
         with self.connect() as connection:
-            rows = connection.execute("SELECT payload FROM projects ORDER BY created_at DESC").fetchall()
+            rows = connection.execute("SELECT payload FROM projects" + (" WHERE tenant_id=?" if tenant_id else "") + " ORDER BY created_at DESC",
+                                      (tenant_id,) if tenant_id else ()).fetchall()
         summaries = []
         for row in rows:
             project = json.loads(row["payload"])
@@ -71,6 +84,9 @@ class Storage:
         payload = json.dumps(chapter, ensure_ascii=False, sort_keys=True)
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            project = connection.execute("SELECT tenant_id FROM projects WHERE id=?", (project_id,)).fetchone()
+            if project is None:
+                raise ValueError("作品不存在")
             existing = connection.execute(
                 "SELECT * FROM jobs WHERE project_id=? AND chapter_index=? AND payload=? "
                 "AND status IN ('queued', 'running', 'merging') LIMIT 1",
@@ -82,8 +98,8 @@ class Storage:
             now = timestamp()
             connection.execute(
                 "INSERT INTO jobs (id, project_id, chapter_index, chapter_title, status, total, "
-                "created_at, updated_at, payload) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?)",
-                (job_id, project_id, chapter_index, chapter["title"], len(chapter["segments"]), now, now, payload),
+                "created_at, updated_at, payload, tenant_id) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)",
+                (job_id, project_id, chapter_index, chapter["title"], len(chapter["segments"]), now, now, payload, project["tenant_id"]),
             )
         return self.get_job(job_id), True
 
@@ -93,14 +109,16 @@ class Storage:
         result["payload"] = json.loads(result["payload"])
         return result
 
-    def get_job(self, job_id: str) -> dict[str, Any] | None:
+    def get_job(self, job_id: str, tenant_id: str | None = None) -> dict[str, Any] | None:
         with self.connect() as connection:
-            row = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            row = connection.execute("SELECT * FROM jobs WHERE id=?" + (" AND tenant_id=?" if tenant_id else ""),
+                                     (job_id, tenant_id) if tenant_id else (job_id,)).fetchone()
         return self._job(row) if row else None
 
-    def list_jobs(self) -> list[dict[str, Any]]:
+    def list_jobs(self, tenant_id: str | None = None) -> list[dict[str, Any]]:
         with self.connect() as connection:
-            rows = connection.execute("SELECT * FROM jobs ORDER BY created_at DESC").fetchall()
+            rows = connection.execute("SELECT * FROM jobs" + (" WHERE tenant_id=?" if tenant_id else "") + " ORDER BY created_at DESC",
+                                      (tenant_id,) if tenant_id else ()).fetchall()
         return [self._job(row) for row in rows]
 
     def update_job(self, job_id: str, **fields: Any) -> None:

@@ -51,7 +51,7 @@ class JobManager:
                 )
                 settings = self.storage.settings
                 generator = TTSGenerator(
-                    settings.audio_dir / job_id,
+                    settings.audio_dir / job["tenant_id"] / job_id,
                     connect_timeout=settings.connect_timeout,
                     receive_timeout=settings.receive_timeout,
                 )
